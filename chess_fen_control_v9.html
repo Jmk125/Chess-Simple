@@ -284,7 +284,7 @@
     </label>
     <button id="engineHint" class="secondary">Hint</button>
   </div>
-  <div id="engineInfo" class="small">Engine: off (tries Stockfish; falls back to built-in bot if unavailable)</div>
+  <div id="engineInfo" class="small">Engine: off (Stockfish local-first; fallback bot if blocked)</div>
 
   <div id="status" class="status"></div>
 
@@ -359,7 +359,7 @@
   let legalForSelection = [];
 
   const ENGINE_URL_REMOTE = "https://cdn.jsdelivr.net/npm/stockfish.js@10.0.2/stockfish.js";
-  const ENGINE_URL_LOCAL = "./stockfish.js";
+  const ENGINE_URL_LOCALS = ["./stockfish.js", "./stockfish-18.js", "./stockfish-18-lite.js"];
   const ENGINE_PRESET = {
     easy:   { skill: 2,  movetime: 250 },
     medium: { skill: 8,  movetime: 700 },
@@ -1221,7 +1221,9 @@
   function buildEngineSources(){
     const isFile = location.protocol === "file:";
     // file:// pages cannot load cross-origin CDN worker scripts.
-    return isFile ? [ENGINE_URL_LOCAL] : [ENGINE_URL_LOCAL, ENGINE_URL_REMOTE];
+    const local = ENGINE_URL_LOCALS.slice();
+    // file:// pages cannot load cross-origin CDN worker scripts.
+    return isFile ? local : [...local, ENGINE_URL_REMOTE];
   }
 
   function attachEngineHandlers(){
@@ -1253,12 +1255,13 @@
       }
     };
 
-    engine.worker.onerror = () => {
-      engine.lastError = "Stockfish worker crashed.";
+    engine.worker.onerror = (ev) => {
+      const detail = ev && ev.message ? ` (${ev.message})` : "";
+      engine.lastError = "Stockfish worker crashed" + detail + ".";
       if(location.protocol === "file:"){
-        engine.lastError += " Open via local server (http://localhost:PORT) or put stockfish.js beside this HTML.";
+        engine.lastError += " Use local server (http://localhost:PORT) and keep stockfish.js in the same folder.";
       } else {
-        engine.lastError += " If this host blocks CDN worker imports, add stockfish.js next to this HTML.";
+        engine.lastError += " If you use a Stockfish 17/18 JS build, also copy its companion .wasm/.nnue files into this folder.";
       }
       engine.thinking = false;
       engine.ready = false;
@@ -1278,26 +1281,31 @@
 
     const sources = buildEngineSources();
     for(const src of sources){
-      try{
-        engine.worker = new Worker(src);
-        attachEngineHandlers();
-        return true;
-      }catch(e1){
-        try{
+      const attempts = [
+        () => new Worker(src),
+        () => new Worker(src, {type:"module"}),
+        () => {
           const blob = new Blob([`importScripts(${JSON.stringify(src)});`], {type:"application/javascript"});
-          const blobUrl = URL.createObjectURL(blob);
-          engine.worker = new Worker(blobUrl);
+          return new Worker(URL.createObjectURL(blob));
+        }
+      ];
+
+      for(const mk of attempts){
+        try{
+          engine.worker = mk();
           attachEngineHandlers();
           return true;
-        }catch(e2){
-          // try next source
+        }catch(_err){
+          // try next worker strategy
         }
       }
     }
 
     engine.lastError = "Could not start Stockfish worker.";
     if(location.protocol === "file:"){
-      engine.lastError += " file:// blocks CDN workers. Put stockfish.js next to this HTML OR serve over http (python -m http.server).";
+      engine.lastError += " file:// blocks CDN workers. Serve over http and keep stockfish.js beside this HTML.";
+    } else {
+      engine.lastError += " Local files tried: stockfish.js, stockfish-18.js, stockfish-18-lite.js. Stockfish 17/18 also needs its companion .wasm/.nnue files.";
     }
     setEngineInfo(`Engine error: ${engine.lastError} Using fallback bot.`);
     engine.usingFallback = true;
