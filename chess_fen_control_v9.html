@@ -284,7 +284,7 @@
     </label>
     <button id="engineHint" class="secondary">Hint</button>
   </div>
-  <div id="engineInfo" class="small">Engine: off (for file:// usage, place stockfish.js in this folder or run a local server)</div>
+  <div id="engineInfo" class="small">Engine: off (tries Stockfish; falls back to built-in bot if unavailable)</div>
 
   <div id="status" class="status"></div>
 
@@ -376,7 +376,8 @@
     thinking: false,
     hintMode: false,
     expectedFen: null,
-    lastError: ""
+    lastError: "",
+    usingFallback: false
   };
 
   function cloneBoard(b){
@@ -1158,10 +1159,69 @@
     if(engineInfoEl) engineInfoEl.textContent = msg;
   }
 
+
+  function evaluateMoveHeuristic(m){
+    let score = 0;
+    if(m.capture){
+      const val = {P:1,N:3,B:3,R:5,Q:9,K:100};
+      score += 10 + (val[m.capture.t] || 0) - ((val[m.piece.t] || 0) * 0.05);
+    }
+    if(m.flags && m.flags.has("promotion")) score += 8;
+
+    // Give points if move gives check or mate
+    const snap = snapshotState();
+    applyMoveOnBoard(m);
+    const oppSide = S.turn;
+    if(isKingInCheck(oppSide)) score += 2;
+    const oppMoves = generateLegalMoves(oppSide);
+    if(oppMoves.length === 0 && isKingInCheck(oppSide)) score += 1000;
+    restoreSnapshot(snap);
+
+    // Small center preference
+    const cx = Math.abs(3.5 - m.to.x);
+    const cy = Math.abs(3.5 - m.to.y);
+    score += (3.5 - (cx + cy) / 2) * 0.2;
+    return score;
+  }
+
+  function getFallbackDepth(){
+    switch(engine.level){
+      case "easy": return 6;
+      case "medium": return 10;
+      case "hard": return 14;
+      case "expert": return 20;
+      default: return 10;
+    }
+  }
+
+  function pickFallbackMove(){
+    const legal = generateLegalMoves(S.turn);
+    if(!legal.length) return null;
+
+    const scored = legal.map(m => ({m, score: evaluateMoveHeuristic(m) + Math.random() * 0.25}));
+    scored.sort((a,b) => b.score - a.score);
+
+    const poolN = Math.min(getFallbackDepth(), scored.length);
+    const pool = scored.slice(0, poolN);
+    return pool[Math.floor(Math.random() * pool.length)].m;
+  }
+
+  function runFallbackEngine({hint=false} = {}){
+    const m = pickFallbackMove();
+    if(!m) return;
+    const uci = algebraicSquare(m.from.x, m.from.y) + algebraicSquare(m.to.x, m.to.y) + (m.flags.has("promotion") ? "q" : "");
+    if(hint){
+      setEngineInfo(`Hint (fallback bot): ${uci}`);
+      return;
+    }
+    setEngineInfo(`Fallback bot played: ${uci}`);
+    makeMove(m);
+  }
+
   function buildEngineSources(){
     const isFile = location.protocol === "file:";
     // file:// pages cannot load cross-origin CDN worker scripts.
-    return isFile ? [ENGINE_URL_LOCAL] : [ENGINE_URL_REMOTE, ENGINE_URL_LOCAL];
+    return isFile ? [ENGINE_URL_LOCAL] : [ENGINE_URL_LOCAL, ENGINE_URL_REMOTE];
   }
 
   function attachEngineHandlers(){
@@ -1170,6 +1230,7 @@
       if(!line) return;
       if(line === "readyok"){
         engine.ready = true;
+        engine.usingFallback = false;
         setEngineInfo("Engine ready.");
         maybeRequestEngineMove();
         return;
@@ -1196,10 +1257,16 @@
       engine.lastError = "Stockfish worker crashed.";
       if(location.protocol === "file:"){
         engine.lastError += " Open via local server (http://localhost:PORT) or put stockfish.js beside this HTML.";
+      } else {
+        engine.lastError += " If this host blocks CDN worker imports, add stockfish.js next to this HTML.";
       }
       engine.thinking = false;
       engine.ready = false;
-      setEngineInfo(`Engine error: ${engine.lastError}`);
+      engine.usingFallback = true;
+      setEngineInfo(`Engine error: ${engine.lastError} Using fallback bot.`);
+      if(engine.enabled && S.turn===engine.side){
+        setTimeout(() => runFallbackEngine({hint:false}), 120);
+      }
     };
 
     engine.worker.postMessage("uci");
@@ -1232,7 +1299,8 @@
     if(location.protocol === "file:"){
       engine.lastError += " file:// blocks CDN workers. Put stockfish.js next to this HTML OR serve over http (python -m http.server).";
     }
-    setEngineInfo(`Engine error: ${engine.lastError}`);
+    setEngineInfo(`Engine error: ${engine.lastError} Using fallback bot.`);
+    engine.usingFallback = true;
     return false;
 
   }
@@ -1275,7 +1343,10 @@
   }
 
   function requestEngineMove({hint=false} = {}){
-    if(!ensureEngineWorker()) return;
+    if(!ensureEngineWorker()){
+      runFallbackEngine({hint});
+      return;
+    }
     if(!engine.ready){
       setEngineInfo("Engine starting...");
       return;
