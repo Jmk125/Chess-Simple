@@ -1173,16 +1173,31 @@
   }
 
   async function probeEngineSources(sources){
+    const out = [];
     for(const src of sources){
       if(!src.startsWith("./")) continue;
       try{
         const res = await fetch(src, {method:"GET", cache:"no-store"});
         const ct = (res.headers.get("content-type") || "").toLowerCase();
         pushEngineDebug(`probe ${src}: status=${res.status} content-type=${ct || "(none)"}`);
+        if(res.ok && (ct.includes("javascript") || ct.includes("text/plain") || ct.includes("octet-stream"))){
+          out.push(src);
+        }
       }catch(err){
         pushEngineDebug(`probe ${src}: fetch failed (${err && err.message ? err.message : err})`);
       }
     }
+    return out;
+  }
+
+  async function resolveEngineSources(){
+    const raw = buildEngineSources();
+    const local = raw.filter(x => x.startsWith("./"));
+    const remote = raw.filter(x => !x.startsWith("./"));
+    const existingLocal = await probeEngineSources(local);
+    const resolved = [...existingLocal, ...remote];
+    pushEngineDebug(`resolved sources: ${resolved.join(", ") || "(none)"}`);
+    return resolved;
   }
 
 
@@ -1302,12 +1317,12 @@
     engine.worker.postMessage("isready");
   }
 
-  function ensureEngineWorker(){
+  async function ensureEngineWorker(){
     if(engine.worker) return true;
 
-    const sources = buildEngineSources();
-    pushEngineDebug(`engine init; protocol=${location.protocol}; trying: ${sources.join(", ")}`);
-    probeEngineSources(sources);
+    const planned = buildEngineSources();
+    pushEngineDebug(`engine init; protocol=${location.protocol}; trying: ${planned.join(", ")}`);
+    const sources = await resolveEngineSources();
 
     for(const src of sources){
       const attempts = [
@@ -1322,7 +1337,7 @@
       for(const mk of attempts){
         try{
           engine.worker = mk();
-          pushEngineDebug(`worker started using ${src}`);
+          pushEngineDebug(`worker constructor returned for ${src}`);
           attachEngineHandlers();
           return true;
         }catch(_err){
@@ -1381,8 +1396,8 @@
     return true;
   }
 
-  function requestEngineMove({hint=false} = {}){
-    if(!ensureEngineWorker()){
+  async function requestEngineMove({hint=false} = {}){
+    if(!await ensureEngineWorker()){
       runFallbackEngine({hint});
       return;
     }
