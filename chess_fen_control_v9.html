@@ -152,6 +152,14 @@
     }
     button:active{ transform: translateY(1px); }
 
+    select{
+      background: rgba(0,0,0,.25);
+      border: 1px solid rgba(255,255,255,.18);
+      color: var(--text);
+      padding: 6px 8px;
+      border-radius: 8px;
+    }
+
     textarea{
       width:100%;
       min-height: 140px;
@@ -258,6 +266,30 @@
     <button id="undoTurn" class="secondary">Undo Turn</button>
   </div>
 
+  <div class="checkrow" style="margin-top:10px;">
+    <label><input type="checkbox" id="engineEnabled" /> Play vs Engine</label>
+    <label>Engine side:
+      <select id="engineSide">
+        <option value="b" selected>Black</option>
+        <option value="w">White</option>
+      </select>
+    </label>
+    <label>Difficulty:
+      <select id="engineLevel">
+        <option value="easy">Easy</option>
+        <option value="medium" selected>Medium</option>
+        <option value="hard">Hard</option>
+        <option value="expert">Expert</option>
+      </select>
+    </label>
+    <button id="engineHint" class="secondary">Hint</button>
+  </div>
+  <div id="engineInfo" class="small">Engine: off (local Stockfish; use serve_chess.py for Stockfish-18 threaded builds)</div>
+  <details class="small" style="margin-top:4px;">
+    <summary>Engine diagnostics</summary>
+    <pre id="engineDebug" style="white-space:pre-wrap;max-height:120px;overflow:auto;margin:6px 0 0 0;"></pre>
+  </details>
+
   <div id="status" class="status"></div>
 
   <div class="muted">Moves (SAN-ish):</div>
@@ -313,6 +345,13 @@
   const btnUndo = document.getElementById("undo");
   const btnUndoTurn = document.getElementById("undoTurn");
 
+  const cbEngineEnabled = document.getElementById("engineEnabled");
+  const selEngineSide = document.getElementById("engineSide");
+  const selEngineLevel = document.getElementById("engineLevel");
+  const btnEngineHint = document.getElementById("engineHint");
+  const engineInfoEl = document.getElementById("engineInfo");
+  const engineDebugEl = document.getElementById("engineDebug");
+
   const fileTop = document.getElementById("fileTop");
   const fileBottom = document.getElementById("fileBottom");
   const rankLeft = document.getElementById("rankLeft");
@@ -323,6 +362,28 @@
   let S = null;
   let selection = null;
   let legalForSelection = [];
+
+  const ENGINE_URL_LOCALS = ["./stockfish.js", "./stockfish18.js", "./stockfish-18.js", "./stockfish-18-lite.js"];
+  const ENGINE_PRESET = {
+    easy:   { skill: 2,  movetime: 250 },
+    medium: { skill: 8,  movetime: 700 },
+    hard:   { skill: 14, movetime: 1500 },
+    expert: { skill: 20, movetime: 3000 }
+  };
+
+  const engine = {
+    worker: null,
+    ready: false,
+    enabled: false,
+    side: "b",
+    level: "medium",
+    thinking: false,
+    hintMode: false,
+    expectedFen: null,
+    lastError: "",
+    usingFallback: false,
+    sawSabOnlyBuild: false
+  };
 
   function cloneBoard(b){
     return b.map(row => row.map(p => p ? ({c:p.c, t:p.t}) : null));
@@ -483,11 +544,13 @@
   }
 
   function loadFenFromInput(){
+    stopEngineThinking();
     try{
       const next = safeLoadFENString(fenInputEl.value);
       S = next;
       selection=null; legalForSelection=[];
       render();
+      maybeRequestEngineMove();
     }catch(err){
       const msg = (err && err.message) ? err.message : String(err);
       const old = statusEl.innerHTML;
@@ -966,14 +1029,17 @@
     selection = null;
     legalForSelection = [];
     render();
+    maybeRequestEngineMove();
   }
 
   function undo(){
+    stopEngineThinking();
     if(S.history.length===0) return;
     const last = S.history.pop();
     restoreSnapshot(last.undo);
     selection=null; legalForSelection=[];
     render();
+    maybeRequestEngineMove();
   }
 
 
@@ -985,6 +1051,11 @@
   }
 
   function onSquareClick(e){
+    if(engine.enabled && S.turn===engine.side){
+      setEngineInfo("Engine to move...");
+      return;
+    }
+
     const x = Number(e.currentTarget.dataset.x);
     const y = Number(e.currentTarget.dataset.y);
     const p = S.board[y][x];
@@ -1076,6 +1147,10 @@
       else line += " — <b>STALEMATE</b>";
     }
     line += `<div class="muted">Castling: ${S.castling || "-"} | En passant: ${S.ep || "-"}</div>`;
+    const engineState = engine.enabled
+      ? `Engine: ${engine.side==="w"?"White":"Black"} (${engine.level})${engine.thinking?" — thinking":""}`
+      : "Engine: off";
+    line += `<div class="muted">${engineState}</div>`;
 
     statusEl.innerHTML = line;
     movesEl.value = S.history.map(h => h.san).join("\n");
@@ -1084,10 +1159,337 @@
     movesEl.scrollTop = movesEl.scrollHeight;
   }
 
+
+  function setEngineInfo(msg){
+    if(engineInfoEl) engineInfoEl.textContent = msg;
+  }
+
+  function pushEngineDebug(msg){
+    if(!engineDebugEl) return;
+    const ts = new Date().toLocaleTimeString();
+    engineDebugEl.textContent += `[${ts}] ${msg}
+`;
+    engineDebugEl.scrollTop = engineDebugEl.scrollHeight;
+  }
+
+  function sourceNeedsSharedArrayBuffer(src){
+    return /stockfish-18(?!-lite)\.js$/i.test(src);
+  }
+
+  async function probeEngineSources(sources){
+    const out = [];
+    for(const src of sources){
+      if(!src.startsWith("./")) continue;
+      try{
+        const res = await fetch(src, {method:"GET", cache:"no-store"});
+        const ct = (res.headers.get("content-type") || "").toLowerCase();
+        pushEngineDebug(`probe ${src}: status=${res.status} content-type=${ct || "(none)"}`);
+        if(res.ok && (ct.includes("javascript") || ct.includes("text/plain") || ct.includes("octet-stream"))){
+          if(!globalThis.SharedArrayBuffer && sourceNeedsSharedArrayBuffer(src)){
+            engine.sawSabOnlyBuild = true;
+            pushEngineDebug(`skip ${src}: requires SharedArrayBuffer (cross-origin isolation)`);
+          } else {
+            out.push(src);
+          }
+        }
+      }catch(err){
+        pushEngineDebug(`probe ${src}: fetch failed (${err && err.message ? err.message : err})`);
+      }
+    }
+    return out;
+  }
+
+  async function resolveEngineSources(){
+    const raw = buildEngineSources();
+    const existingLocal = await probeEngineSources(raw);
+    const resolved = [...existingLocal];
+    if(!globalThis.SharedArrayBuffer){
+      pushEngineDebug("SharedArrayBuffer unavailable in this page context.");
+      if(engine.sawSabOnlyBuild){
+        pushEngineDebug("Detected threaded Stockfish build. Run: python serve_chess.py then open http://127.0.0.1:4173/");
+      }
+      if(!resolved.length){
+        pushEngineDebug("No SAB-safe local engine found. Add non-threaded stockfish.js in this folder.");
+      }
+    }
+    pushEngineDebug(`resolved sources: ${resolved.join(", ") || "(none)"}`);
+    return resolved;
+  }
+
+
+  function evaluateMoveHeuristic(m){
+    let score = 0;
+    if(m.capture){
+      const val = {P:1,N:3,B:3,R:5,Q:9,K:100};
+      score += 10 + (val[m.capture.t] || 0) - ((val[m.piece.t] || 0) * 0.05);
+    }
+    if(m.flags && m.flags.has("promotion")) score += 8;
+
+    // Give points if move gives check or mate
+    const snap = snapshotState();
+    applyMoveOnBoard(m);
+    const oppSide = S.turn;
+    if(isKingInCheck(oppSide)) score += 2;
+    const oppMoves = generateLegalMoves(oppSide);
+    if(oppMoves.length === 0 && isKingInCheck(oppSide)) score += 1000;
+    restoreSnapshot(snap);
+
+    // Small center preference
+    const cx = Math.abs(3.5 - m.to.x);
+    const cy = Math.abs(3.5 - m.to.y);
+    score += (3.5 - (cx + cy) / 2) * 0.2;
+    return score;
+  }
+
+  function getFallbackDepth(){
+    switch(engine.level){
+      case "easy": return 6;
+      case "medium": return 10;
+      case "hard": return 14;
+      case "expert": return 20;
+      default: return 10;
+    }
+  }
+
+  function pickFallbackMove(){
+    const legal = generateLegalMoves(S.turn);
+    if(!legal.length) return null;
+
+    const scored = legal.map(m => ({m, score: evaluateMoveHeuristic(m) + Math.random() * 0.25}));
+    scored.sort((a,b) => b.score - a.score);
+
+    const poolN = Math.min(getFallbackDepth(), scored.length);
+    const pool = scored.slice(0, poolN);
+    return pool[Math.floor(Math.random() * pool.length)].m;
+  }
+
+  function runFallbackEngine({hint=false} = {}){
+    const m = pickFallbackMove();
+    if(!m) return;
+    const uci = algebraicSquare(m.from.x, m.from.y) + algebraicSquare(m.to.x, m.to.y) + (m.flags.has("promotion") ? "q" : "");
+    if(hint){
+      setEngineInfo(`Hint (fallback bot): ${uci}`);
+      return;
+    }
+    setEngineInfo(`Fallback bot played: ${uci}`);
+    makeMove(m);
+  }
+
+  function buildEngineSources(){
+    // Use local-only worker sources to avoid browser cross-origin worker restrictions.
+    return ENGINE_URL_LOCALS.slice();
+  }
+
+  function reportEngineRuntimeError(ev){
+    const detail = ev && ev.message ? ` (${ev.message})` : "";
+    const raw = ev && ev.message ? String(ev.message) : "";
+    engine.lastError = "Stockfish worker crashed" + detail + ".";
+    if(raw.includes("SharedArrayBuffer")){
+      engine.lastError = "This Stockfish build requires SharedArrayBuffer / cross-origin isolation. Use stockfish.js (non-threaded) or serve with COOP+COEP headers.";
+    }
+    if(location.protocol === "file:"){
+      engine.lastError += " Use local server (http://localhost:PORT) and keep stockfish.js in the same folder.";
+    } else {
+      engine.lastError += " Use a local non-threaded stockfish.js build, or run a cross-origin-isolated server for threaded builds.";
+    }
+    engine.thinking = false;
+    engine.ready = false;
+    engine.usingFallback = true;
+    setEngineInfo(`Engine error: ${engine.lastError} Using fallback bot.`);
+    if(engine.enabled && S.turn===engine.side){
+      setTimeout(() => runFallbackEngine({hint:false}), 120);
+    }
+  }
+
+  function attachEngineHandlers(){
+    if(!engine.worker) return;
+    engine.worker.onmessage = (ev) => {
+      const line = String(ev.data || "").trim();
+      if(!line) return;
+      if(line.startsWith("bestmove")){
+        const parts = line.split(/\s+/);
+        const bm = parts[1];
+        const expected = engine.expectedFen;
+        engine.thinking = false;
+        engine.expectedFen = null;
+        if(!bm || bm === "(none)") return;
+        if(!expected || expected !== toFEN()) return; // stale result
+        if(engine.hintMode){
+          engine.hintMode = false;
+          setEngineInfo(`Hint: ${bm}`);
+          return;
+        }
+        const moved = applyUCIMove(bm);
+        setEngineInfo(moved ? `Engine played: ${bm}` : `Engine move rejected: ${bm}`);
+      }
+    };
+
+    engine.worker.onerror = reportEngineRuntimeError;
+  }
+
+  function waitForWorkerReady(worker, src){
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (ok, reason) => {
+        if(done) return;
+        done = true;
+        clearTimeout(timer);
+        if(!ok){
+          try{ worker.terminate(); }catch(_e){}
+          pushEngineDebug(`worker init failed for ${src}: ${reason}`);
+        }
+        resolve(ok);
+      };
+
+      const timer = setTimeout(() => finish(false, "ready timeout"), 2200);
+
+      worker.onmessage = (ev) => {
+        const line = String(ev.data || "").trim();
+        if(line === "readyok") finish(true, "readyok");
+      };
+      worker.onerror = (ev) => {
+        const msg = ev && ev.message ? ev.message : "worker error";
+        finish(false, msg);
+      };
+
+      try{
+        worker.postMessage("uci");
+        worker.postMessage("isready");
+      }catch(err){
+        finish(false, err && err.message ? err.message : String(err));
+      }
+    });
+  }
+
+  async function ensureEngineWorker(){
+    if(engine.worker) return true;
+
+    const planned = buildEngineSources();
+    pushEngineDebug(`engine init; protocol=${location.protocol}; trying: ${planned.join(", ")}`);
+    const sources = await resolveEngineSources();
+
+    for(const src of sources){
+      const attempts = [
+        () => new Worker(src),
+        () => new Worker(src, {type:"module"}),
+        () => {
+          const blob = new Blob([`importScripts(${JSON.stringify(src)});`], {type:"application/javascript"});
+          return new Worker(URL.createObjectURL(blob));
+        }
+      ];
+
+      for(const mk of attempts){
+        let candidate = null;
+        try{
+          candidate = mk();
+          pushEngineDebug(`worker constructor returned for ${src}`);
+          const ready = await waitForWorkerReady(candidate, src);
+          if(!ready) continue;
+          engine.worker = candidate;
+          engine.ready = true;
+          engine.usingFallback = false;
+          setEngineInfo("Engine ready.");
+          attachEngineHandlers();
+          return true;
+        }catch(_err){
+          pushEngineDebug(`worker strategy failed for ${src}`)
+          if(candidate){ try{ candidate.terminate(); }catch(__){} }
+        }
+      }
+    }
+
+    engine.lastError = "Could not start Stockfish worker.";
+    if(engine.sawSabOnlyBuild && !globalThis.SharedArrayBuffer){
+      engine.lastError = "Detected threaded Stockfish build but SharedArrayBuffer is unavailable. Run python serve_chess.py for COOP/COEP headers.";
+    }
+    pushEngineDebug("all worker startup attempts failed");
+    if(location.protocol === "file:"){
+      engine.lastError += " file:// blocks CDN workers. Serve over http and keep stockfish.js beside this HTML.";
+    } else {
+      engine.lastError += " Local files tried: stockfish.js, stockfish-18.js, stockfish-18-lite.js. Stockfish 17/18 also needs its companion .wasm/.nnue files.";
+    }
+    setEngineInfo(`Engine error: ${engine.lastError} Using fallback bot.`);
+    engine.usingFallback = true;
+    return false;
+
+  }
+
+  function applyEngineOptions(){
+    if(!engine.worker || !engine.ready) return;
+    const preset = ENGINE_PRESET[engine.level] || ENGINE_PRESET.medium;
+    engine.worker.postMessage(`setoption name Skill Level value ${preset.skill}`);
+  }
+
+  function stopEngineThinking(){
+    if(engine.worker && engine.thinking){
+      engine.worker.postMessage("stop");
+    }
+    engine.thinking = false;
+    engine.hintMode = false;
+    engine.expectedFen = null;
+  }
+
+  function applyUCIMove(uci){
+    if(!uci || uci.length < 4) return false;
+    const fromX = uci.charCodeAt(0)-97;
+    const fromY = Number(uci[1])-1;
+    const toX = uci.charCodeAt(2)-97;
+    const toY = Number(uci[3])-1;
+    const promo = uci[4] ? uci[4].toUpperCase() : null;
+
+    if(!inBounds(fromX,fromY) || !inBounds(toX,toY)) return false;
+
+    const legal = generateLegalMoves(S.turn);
+    const match = legal.find(m =>
+      m.from.x===fromX && m.from.y===fromY && m.to.x===toX && m.to.y===toY &&
+      ((m.flags.has("promotion") ? (m.promoteTo || "Q") : null) === (promo || null) ||
+      (m.flags.has("promotion") && (!promo || promo==="Q")))
+    );
+    if(!match) return false;
+
+    makeMove(match);
+    return true;
+  }
+
+  async function requestEngineMove({hint=false} = {}){
+    if(!await ensureEngineWorker()){
+      runFallbackEngine({hint});
+      return;
+    }
+    if(!engine.ready){
+      setEngineInfo("Engine starting...");
+      return;
+    }
+    if(engine.thinking) return;
+
+    const legal = generateLegalMoves(S.turn);
+    if(legal.length===0) return;
+
+    const fen = toFEN();
+    const preset = ENGINE_PRESET[engine.level] || ENGINE_PRESET.medium;
+    applyEngineOptions();
+    engine.expectedFen = fen;
+    engine.hintMode = hint;
+    engine.thinking = true;
+    setEngineInfo(hint ? "Engine calculating hint..." : "Engine thinking...");
+    engine.worker.postMessage(`position fen ${fen}`);
+    engine.worker.postMessage(`go movetime ${preset.movetime}`);
+  }
+
+  function maybeRequestEngineMove(){
+    if(!engine.enabled) return;
+    if(S.turn !== engine.side) return;
+    const legal = generateLegalMoves(S.turn);
+    if(legal.length===0) return;
+    requestEngineMove({hint:false});
+  }
+
   function newGame(){
+    stopEngineThinking();
     S = parseFEN(START_FEN);
     selection=null; legalForSelection=[];
     render();
+    maybeRequestEngineMove();
   }
 
   btnNew.addEventListener("click", newGame);
@@ -1108,6 +1510,36 @@
   if(cbMine) cbMine.addEventListener("change", render);
   if(cbOpp) cbOpp.addEventListener("change", render);
 
+  if(cbEngineEnabled) cbEngineEnabled.addEventListener("change", () => {
+    engine.enabled = !!cbEngineEnabled.checked;
+    stopEngineThinking();
+    if(engine.enabled){
+      setEngineInfo("Engine enabled.");
+      maybeRequestEngineMove();
+    }else{
+      setEngineInfo("Engine: off");
+    }
+    render();
+  });
+
+  if(selEngineSide) selEngineSide.addEventListener("change", () => {
+    engine.side = selEngineSide.value === "w" ? "w" : "b";
+    stopEngineThinking();
+    setEngineInfo(`Engine side: ${engine.side === "w" ? "White" : "Black"}`);
+    render();
+    maybeRequestEngineMove();
+  });
+
+  if(selEngineLevel) selEngineLevel.addEventListener("change", () => {
+    engine.level = selEngineLevel.value in ENGINE_PRESET ? selEngineLevel.value : "medium";
+    applyEngineOptions();
+    setEngineInfo(`Engine difficulty: ${engine.level}`);
+    render();
+  });
+
+  if(btnEngineHint) btnEngineHint.addEventListener("click", () => {
+    requestEngineMove({hint:true});
+  });
 
   newGame();
 })();
