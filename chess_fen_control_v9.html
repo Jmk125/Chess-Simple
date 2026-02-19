@@ -284,7 +284,7 @@
     </label>
     <button id="engineHint" class="secondary">Hint</button>
   </div>
-  <div id="engineInfo" class="small">Engine: off (Stockfish local-first; fallback bot if blocked; SAB-safe auto-skip)</div>
+  <div id="engineInfo" class="small">Engine: off (local Stockfish only; fallback bot if unavailable)</div>
   <details class="small" style="margin-top:4px;">
     <summary>Engine diagnostics</summary>
     <pre id="engineDebug" style="white-space:pre-wrap;max-height:120px;overflow:auto;margin:6px 0 0 0;"></pre>
@@ -363,7 +363,6 @@
   let selection = null;
   let legalForSelection = [];
 
-  const ENGINE_URL_REMOTE = "https://cdn.jsdelivr.net/npm/stockfish.js@10.0.2/stockfish.js";
   const ENGINE_URL_LOCALS = ["./stockfish.js", "./stockfish18.js", "./stockfish-18.js", "./stockfish-18-lite.js"];
   const ENGINE_PRESET = {
     easy:   { skill: 2,  movetime: 250 },
@@ -1200,12 +1199,13 @@
 
   async function resolveEngineSources(){
     const raw = buildEngineSources();
-    const local = raw.filter(x => x.startsWith("./"));
-    const remote = raw.filter(x => !x.startsWith("./"));
-    const existingLocal = await probeEngineSources(local);
-    const resolved = [...existingLocal, ...remote];
+    const existingLocal = await probeEngineSources(raw);
+    const resolved = [...existingLocal];
     if(!globalThis.SharedArrayBuffer){
       pushEngineDebug("SharedArrayBuffer unavailable in this page context.");
+      if(!resolved.length){
+        pushEngineDebug("No SAB-safe local engine found. Add non-threaded stockfish.js in this folder.");
+      }
     }
     pushEngineDebug(`resolved sources: ${resolved.join(", ") || "(none)"}`);
     return resolved;
@@ -1271,11 +1271,8 @@
   }
 
   function buildEngineSources(){
-    const isFile = location.protocol === "file:";
-    // file:// pages cannot load cross-origin CDN worker scripts.
-    const local = ENGINE_URL_LOCALS.slice();
-    // file:// pages cannot load cross-origin CDN worker scripts.
-    return isFile ? local : [...local, ENGINE_URL_REMOTE];
+    // Use local-only worker sources to avoid browser cross-origin worker restrictions.
+    return ENGINE_URL_LOCALS.slice();
   }
 
   function attachEngineHandlers(){
@@ -1317,7 +1314,7 @@
       if(location.protocol === "file:"){
         engine.lastError += " Use local server (http://localhost:PORT) and keep stockfish.js in the same folder.";
       } else {
-        engine.lastError += " If you use a Stockfish 17/18 JS build, also copy its companion .wasm/.nnue files into this folder.";
+        engine.lastError += " Use a local non-threaded stockfish.js build, or run a cross-origin-isolated server for threaded builds.";
       }
       engine.thinking = false;
       engine.ready = false;
