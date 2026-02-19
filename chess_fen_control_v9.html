@@ -276,10 +276,12 @@
     </label>
     <label>Difficulty:
       <select id="engineLevel">
-        <option value="easy">Easy</option>
-        <option value="medium" selected>Medium</option>
-        <option value="hard">Hard</option>
-        <option value="expert">Expert</option>
+        <option value="beginner">Beginner (800)</option>
+        <option value="easy">Easy (1100)</option>
+        <option value="medium" selected>Medium (1400)</option>
+        <option value="hard">Hard (1700)</option>
+        <option value="expert">Expert (2000)</option>
+        <option value="master">Master (2300)</option>
       </select>
     </label>
     <button id="engineHint" class="secondary">Hint</button>
@@ -365,10 +367,12 @@
 
   const ENGINE_URL_LOCALS = ["./stockfish.js", "./stockfish18.js", "./stockfish-18.js", "./stockfish-18-lite.js"];
   const ENGINE_PRESET = {
-    easy:   { skill: 2,  movetime: 250 },
-    medium: { skill: 8,  movetime: 700 },
-    hard:   { skill: 14, movetime: 1500 },
-    expert: { skill: 20, movetime: 3000 }
+    beginner: { label: "Beginner", skill: 0,  movetime: 220, limitStrength: true, elo: 800,  jitter: 0.35, fallbackDepth: 12 },
+    easy:     { label: "Easy",     skill: 4,  movetime: 420, limitStrength: true, elo: 1100, jitter: 0.28, fallbackDepth: 10 },
+    medium:   { label: "Medium",   skill: 8,  movetime: 900, limitStrength: true, elo: 1400, jitter: 0.20, fallbackDepth: 8 },
+    hard:     { label: "Hard",     skill: 12, movetime: 1600, limitStrength: true, elo: 1700, jitter: 0.14, fallbackDepth: 6 },
+    expert:   { label: "Expert",   skill: 16, movetime: 2600, limitStrength: true, elo: 2000, jitter: 0.10, fallbackDepth: 4 },
+    master:   { label: "Master",   skill: 20, movetime: 3800, limitStrength: true, elo: 2300, jitter: 0.06, fallbackDepth: 2 }
   };
 
   const engine = {
@@ -384,6 +388,10 @@
     usingFallback: false,
     sawSabOnlyBuild: false
   };
+
+  function getEnginePreset(){
+    return ENGINE_PRESET[engine.level] || ENGINE_PRESET.medium;
+  }
 
   function cloneBoard(b){
     return b.map(row => row.map(p => p ? ({c:p.c, t:p.t}) : null));
@@ -1242,20 +1250,15 @@
   }
 
   function getFallbackDepth(){
-    switch(engine.level){
-      case "easy": return 6;
-      case "medium": return 10;
-      case "hard": return 14;
-      case "expert": return 20;
-      default: return 10;
-    }
+    return getEnginePreset().fallbackDepth ?? 8;
   }
 
   function pickFallbackMove(){
     const legal = generateLegalMoves(S.turn);
     if(!legal.length) return null;
 
-    const scored = legal.map(m => ({m, score: evaluateMoveHeuristic(m) + Math.random() * 0.25}));
+    const jitter = getEnginePreset().jitter ?? 0.2;
+    const scored = legal.map(m => ({m, score: evaluateMoveHeuristic(m) + Math.random() * jitter}));
     scored.sort((a,b) => b.score - a.score);
 
     const poolN = Math.min(getFallbackDepth(), scored.length);
@@ -1416,8 +1419,13 @@
 
   function applyEngineOptions(){
     if(!engine.worker || !engine.ready) return;
-    const preset = ENGINE_PRESET[engine.level] || ENGINE_PRESET.medium;
+    const preset = getEnginePreset();
+    engine.worker.postMessage("setoption name UCI_LimitStrength value false");
     engine.worker.postMessage(`setoption name Skill Level value ${preset.skill}`);
+    if(preset.limitStrength){
+      engine.worker.postMessage("setoption name UCI_LimitStrength value true");
+      engine.worker.postMessage(`setoption name UCI_Elo value ${preset.elo}`);
+    }
   }
 
   function stopEngineThinking(){
@@ -1466,7 +1474,7 @@
     if(legal.length===0) return;
 
     const fen = toFEN();
-    const preset = ENGINE_PRESET[engine.level] || ENGINE_PRESET.medium;
+    const preset = getEnginePreset();
     applyEngineOptions();
     engine.expectedFen = fen;
     engine.hintMode = hint;
@@ -1532,8 +1540,9 @@
 
   if(selEngineLevel) selEngineLevel.addEventListener("change", () => {
     engine.level = selEngineLevel.value in ENGINE_PRESET ? selEngineLevel.value : "medium";
+    const preset = getEnginePreset();
     applyEngineOptions();
-    setEngineInfo(`Engine difficulty: ${engine.level}`);
+    setEngineInfo(`Engine difficulty: ${preset.label} (target ${preset.elo} Elo, skill ${preset.skill}, ${preset.movetime}ms/move)`);
     render();
   });
 
