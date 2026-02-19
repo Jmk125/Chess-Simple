@@ -1280,17 +1280,32 @@
     return ENGINE_URL_LOCALS.slice();
   }
 
+  function reportEngineRuntimeError(ev){
+    const detail = ev && ev.message ? ` (${ev.message})` : "";
+    const raw = ev && ev.message ? String(ev.message) : "";
+    engine.lastError = "Stockfish worker crashed" + detail + ".";
+    if(raw.includes("SharedArrayBuffer")){
+      engine.lastError = "This Stockfish build requires SharedArrayBuffer / cross-origin isolation. Use stockfish.js (non-threaded) or serve with COOP+COEP headers.";
+    }
+    if(location.protocol === "file:"){
+      engine.lastError += " Use local server (http://localhost:PORT) and keep stockfish.js in the same folder.";
+    } else {
+      engine.lastError += " Use a local non-threaded stockfish.js build, or run a cross-origin-isolated server for threaded builds.";
+    }
+    engine.thinking = false;
+    engine.ready = false;
+    engine.usingFallback = true;
+    setEngineInfo(`Engine error: ${engine.lastError} Using fallback bot.`);
+    if(engine.enabled && S.turn===engine.side){
+      setTimeout(() => runFallbackEngine({hint:false}), 120);
+    }
+  }
+
   function attachEngineHandlers(){
+    if(!engine.worker) return;
     engine.worker.onmessage = (ev) => {
       const line = String(ev.data || "").trim();
       if(!line) return;
-      if(line === "readyok"){
-        engine.ready = true;
-        engine.usingFallback = false;
-        setEngineInfo("Engine ready.");
-        maybeRequestEngineMove();
-        return;
-      }
       if(line.startsWith("bestmove")){
         const parts = line.split(/\s+/);
         const bm = parts[1];
@@ -1309,29 +1324,41 @@
       }
     };
 
-    engine.worker.onerror = (ev) => {
-      const detail = ev && ev.message ? ` (${ev.message})` : "";
-      const raw = ev && ev.message ? String(ev.message) : "";
-      engine.lastError = "Stockfish worker crashed" + detail + ".";
-      if(raw.includes("SharedArrayBuffer")){
-        engine.lastError = "This Stockfish build requires SharedArrayBuffer / cross-origin isolation. Use stockfish.js (non-threaded) or serve with COOP+COEP headers.";
-      }
-      if(location.protocol === "file:"){
-        engine.lastError += " Use local server (http://localhost:PORT) and keep stockfish.js in the same folder.";
-      } else {
-        engine.lastError += " Use a local non-threaded stockfish.js build, or run a cross-origin-isolated server for threaded builds.";
-      }
-      engine.thinking = false;
-      engine.ready = false;
-      engine.usingFallback = true;
-      setEngineInfo(`Engine error: ${engine.lastError} Using fallback bot.`);
-      if(engine.enabled && S.turn===engine.side){
-        setTimeout(() => runFallbackEngine({hint:false}), 120);
-      }
-    };
+    engine.worker.onerror = reportEngineRuntimeError;
+  }
 
-    engine.worker.postMessage("uci");
-    engine.worker.postMessage("isready");
+  function waitForWorkerReady(worker, src){
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (ok, reason) => {
+        if(done) return;
+        done = true;
+        clearTimeout(timer);
+        if(!ok){
+          try{ worker.terminate(); }catch(_e){}
+          pushEngineDebug(`worker init failed for ${src}: ${reason}`);
+        }
+        resolve(ok);
+      };
+
+      const timer = setTimeout(() => finish(false, "ready timeout"), 2200);
+
+      worker.onmessage = (ev) => {
+        const line = String(ev.data || "").trim();
+        if(line === "readyok") finish(true, "readyok");
+      };
+      worker.onerror = (ev) => {
+        const msg = ev && ev.message ? ev.message : "worker error";
+        finish(false, msg);
+      };
+
+      try{
+        worker.postMessage("uci");
+        worker.postMessage("isready");
+      }catch(err){
+        finish(false, err && err.message ? err.message : String(err));
+      }
+    });
   }
 
   async function ensureEngineWorker(){
@@ -1352,13 +1379,21 @@
       ];
 
       for(const mk of attempts){
+        let candidate = null;
         try{
-          engine.worker = mk();
+          candidate = mk();
           pushEngineDebug(`worker constructor returned for ${src}`);
+          const ready = await waitForWorkerReady(candidate, src);
+          if(!ready) continue;
+          engine.worker = candidate;
+          engine.ready = true;
+          engine.usingFallback = false;
+          setEngineInfo("Engine ready.");
           attachEngineHandlers();
           return true;
         }catch(_err){
           pushEngineDebug(`worker strategy failed for ${src}`)
+          if(candidate){ try{ candidate.terminate(); }catch(__){} }
         }
       }
     }
