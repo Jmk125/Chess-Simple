@@ -284,7 +284,7 @@
     </label>
     <button id="engineHint" class="secondary">Hint</button>
   </div>
-  <div id="engineInfo" class="small">Engine: off (Stockfish local-first; fallback bot if blocked)</div>
+  <div id="engineInfo" class="small">Engine: off (Stockfish local-first; fallback bot if blocked; SAB-safe auto-skip)</div>
   <details class="small" style="margin-top:4px;">
     <summary>Engine diagnostics</summary>
     <pre id="engineDebug" style="white-space:pre-wrap;max-height:120px;overflow:auto;margin:6px 0 0 0;"></pre>
@@ -1172,6 +1172,10 @@
     engineDebugEl.scrollTop = engineDebugEl.scrollHeight;
   }
 
+  function sourceNeedsSharedArrayBuffer(src){
+    return /stockfish-18(?!-lite)\.js$/i.test(src);
+  }
+
   async function probeEngineSources(sources){
     const out = [];
     for(const src of sources){
@@ -1181,7 +1185,11 @@
         const ct = (res.headers.get("content-type") || "").toLowerCase();
         pushEngineDebug(`probe ${src}: status=${res.status} content-type=${ct || "(none)"}`);
         if(res.ok && (ct.includes("javascript") || ct.includes("text/plain") || ct.includes("octet-stream"))){
-          out.push(src);
+          if(!globalThis.SharedArrayBuffer && sourceNeedsSharedArrayBuffer(src)){
+            pushEngineDebug(`skip ${src}: requires SharedArrayBuffer (cross-origin isolation)`);
+          } else {
+            out.push(src);
+          }
         }
       }catch(err){
         pushEngineDebug(`probe ${src}: fetch failed (${err && err.message ? err.message : err})`);
@@ -1196,6 +1204,9 @@
     const remote = raw.filter(x => !x.startsWith("./"));
     const existingLocal = await probeEngineSources(local);
     const resolved = [...existingLocal, ...remote];
+    if(!globalThis.SharedArrayBuffer){
+      pushEngineDebug("SharedArrayBuffer unavailable in this page context.");
+    }
     pushEngineDebug(`resolved sources: ${resolved.join(", ") || "(none)"}`);
     return resolved;
   }
@@ -1298,7 +1309,11 @@
 
     engine.worker.onerror = (ev) => {
       const detail = ev && ev.message ? ` (${ev.message})` : "";
+      const raw = ev && ev.message ? String(ev.message) : "";
       engine.lastError = "Stockfish worker crashed" + detail + ".";
+      if(raw.includes("SharedArrayBuffer")){
+        engine.lastError = "This Stockfish build requires SharedArrayBuffer / cross-origin isolation. Use stockfish.js (non-threaded) or serve with COOP+COEP headers.";
+      }
       if(location.protocol === "file:"){
         engine.lastError += " Use local server (http://localhost:PORT) and keep stockfish.js in the same folder.";
       } else {
